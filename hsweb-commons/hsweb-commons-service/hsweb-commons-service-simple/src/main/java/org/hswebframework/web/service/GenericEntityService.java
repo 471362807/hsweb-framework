@@ -19,14 +19,16 @@
 package org.hswebframework.web.service;
 
 import org.hswebframework.web.commons.entity.GenericEntity;
+import org.hswebframework.web.commons.entity.LogicalDeleteEntity;
 import org.hswebframework.web.commons.entity.RecordCreationEntity;
-import org.hswebframework.web.dao.CrudDao;
+import org.hswebframework.web.commons.entity.RecordModifierEntity;
+import org.hswebframework.web.commons.entity.events.EntityCreatedEvent;
+import org.hswebframework.web.commons.entity.events.EntityModifyEvent;
 import org.hswebframework.web.id.IDGenerator;
-import org.hswebframework.web.validator.DuplicateKeyException;
-import org.hswebframework.web.validator.LogicPrimaryKeyValidator;
 import org.hswebframework.web.validator.group.CreateGroup;
 import org.hswebframework.web.validator.group.UpdateGroup;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
@@ -59,6 +61,13 @@ public abstract class GenericEntityService<E extends GenericEntity<PK>, PK>
      */
     protected abstract IDGenerator<PK> getIDGenerator();
 
+    protected ApplicationEventPublisher eventPublisher;
+
+    @Autowired(required = false)
+    public void setEventPublisher(ApplicationEventPublisher eventPublisher) {
+        this.eventPublisher = eventPublisher;
+    }
+
     @PostConstruct
     public void init() {
         if (logicPrimaryKeyValidator instanceof DefaultLogicPrimaryKeyValidator) {
@@ -68,23 +77,58 @@ public abstract class GenericEntityService<E extends GenericEntity<PK>, PK>
 
     @Override
     public E deleteByPk(PK pk) {
-        Assert.notNull(pk, "parameter can not be null");
         E old = selectByPk(pk);
-        getDao().deleteByPk(pk);
+        if (old == null) {
+            return null;
+        }
+        if (old instanceof LogicalDeleteEntity) {
+            LogicalDeleteEntity deleteEntity = (LogicalDeleteEntity) old;
+            deleteEntity.setDeleted(true);
+            deleteEntity.setDeleteTime(System.currentTimeMillis());
+            createUpdate()
+                    .set(deleteEntity::getDeleted)
+                    .set(deleteEntity::getDeleteTime)
+                    .where(GenericEntity.id, pk)
+                    .exec();
+        } else {
+            if (!physicalDeleteByPk(pk)) {
+                logger.warn("物理删除数据失败,主键:{}", pk);
+            }
+        }
         return old;
+    }
+
+    protected boolean physicalDeleteByPk(PK pk) {
+        //createDelete().where(GenericEntity.id,pk).exec()>0;
+
+        return getDao().deleteByPk(pk) > 0;
+    }
+
+    protected boolean pushModifyEvent() {
+        return RecordModifierEntity.class.isAssignableFrom(entityType);
+    }
+
+    protected boolean pushCreatedEvent() {
+        return RecordCreationEntity.class.isAssignableFrom(entityType);
     }
 
     @Override
     public int updateByPk(PK pk, E entity) {
         Assert.notNull(pk, "primary key can not be null");
+        Assert.hasText(String.valueOf(pk), "primary key can not be null");
         Assert.notNull(entity, "entity can not be null");
         entity.setId(pk);
-        tryValidate(entity, UpdateGroup.class);
 
+        tryValidate(entity, UpdateGroup.class);
+        //尝试推送 EntityModifyEvent 事件.
+        if (eventPublisher != null && pushModifyEvent()) {
+            E old = selectByPk(pk);
+            eventPublisher.publishEvent(new GenericsPayloadApplicationEvent<>(this, new EntityModifyEvent<>(old, entity, getEntityType()), getEntityType()));
+        }
         return createUpdate(entity)
                 //如果是RecordCreationEntity则不修改creator_id和creator_time
                 .when(entity instanceof RecordCreationEntity,
-                        update -> update.and().excludes(RecordCreationEntity.creatorId, RecordCreationEntity.createTime))
+                        update -> update.and().excludes(((RecordCreationEntity) entity).getCreatorIdProperty(), RecordCreationEntity.createTime))
                 .where(GenericEntity.id, pk)
                 .exec();
     }
@@ -137,6 +181,10 @@ public abstract class GenericEntityService<E extends GenericEntity<PK>, PK>
         }
         tryValidate(entity, CreateGroup.class);
         getDao().insert(entity);
+
+        if (eventPublisher != null && pushCreatedEvent()) {
+            eventPublisher.publishEvent(new GenericsPayloadApplicationEvent<>(this, new EntityCreatedEvent<>(entity, getEntityType()), getEntityType()));
+        }
         return entity.getId();
     }
 
